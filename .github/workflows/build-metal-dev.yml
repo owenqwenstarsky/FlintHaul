@@ -1,0 +1,147 @@
+name: Build Metal dev (macOS arm64)
+
+on:
+  workflow_dispatch: # manual only
+
+permissions:
+  contents: read
+
+jobs:
+  macos-arm64-metal:
+    runs-on: macos-26
+
+    steps:
+      - name: Clone
+        id: checkout
+        uses: actions/checkout@v6
+
+      - name: Build
+        id: cmake_build
+        run: |
+          sysctl -a
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_METAL=ON \
+            -DGGML_METAL_EMBED_LIBRARY=ON \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3 \
+            -DCMAKE_INSTALL_RPATH='@loader_path' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DLLAMA_BUILD_BORINGSSL=ON \
+            -DLLAMA_BUILD_TESTS=ON \
+            -DLLAMA_BUILD_TOOLS=ON \
+            -DLLAMA_BUILD_SERVER=ON
+          cmake --build build --config Release -j $(sysctl -n hw.logicalcpu) \
+            --target llama-cli llama-server test-longhaul test-llama-archs
+
+      - name: Pack zip
+        id: pack
+        run: |
+          SHORT="${GITHUB_SHA::7}"
+          PKG="flinthaul-metal-dev-${SHORT}-macos-arm64"
+          rm -rf dist
+          mkdir -p "dist/${PKG}"
+          cp -a build/bin/llama-cli build/bin/llama-server "dist/${PKG}/"
+          cp -a build/bin/*.dylib "dist/${PKG}/"
+          cp LICENSE "dist/${PKG}/"
+          cat > "dist/${PKG}/README.txt" <<EOF
+          FlintHaul Metal dev build (macOS arm64)
+          commit: ${GITHUB_SHA}
+          source: https://github.com/${GITHUB_REPOSITORY}/tree/${GITHUB_SHA}
+
+          Contents: llama-cli, llama-server and the shared libraries they load.
+          Keep all files in this folder together (rpath is @loader_path).
+          The binaries are unsigned dev builds. If macOS blocks them after download, run:
+            xattr -dr com.apple.quarantine .
+
+          Longhaul expert streaming:
+            ./llama-cli -m /path/to/flint.gguf --longhaul --longhaul-cache N
+            ./llama-server -m /path/to/flint.gguf --longhaul --longhaul-cache N
+          N is the expert cache size in GiB (required with --longhaul).
+          Add --n-gpu-layers 99 for all-Metal mode.
+          Use --n-gpu-layers 0 to run all repeating layers on CPU.
+
+          See docs/longhaul.md in the source tree for details and limits.
+          EOF
+          (cd dist && zip -r -y -q "../${PKG}.zip" "${PKG}")
+          ls -la "${PKG}.zip"
+          unzip -l "${PKG}.zip"
+          echo "PKG=${PKG}" >> "$GITHUB_ENV"
+
+      - name: Smoke test packaged binaries
+        id: smoke
+        run: |
+          rm -rf smoke
+          mkdir smoke
+          unzip -q "${PKG}.zip" -d smoke
+          cd "smoke/${PKG}"
+          ls -la
+          echo "--- rpaths and linked libraries"
+          for f in llama-cli llama-server *.dylib; do
+            echo "## $f"
+            otool -l "$f" | grep -A2 LC_RPATH || true
+            otool -L "$f"
+          done
+          # packaged files must not link against the build tree
+          if otool -L llama-cli llama-server *.dylib | grep -E "${GITHUB_WORKSPACE}|/build/"; then
+            echo "packaged binary links against the build tree"
+            exit 1
+          fi
+          for tool in llama-cli llama-server; do
+            echo "--- ${tool} --version"
+            ./${tool} --version > "${tool}.version.txt" 2>&1
+            cat "${tool}.version.txt"
+            echo "--- ${tool} --help"
+            ./${tool} --help > "${tool}.help.txt" 2>&1 || true
+            if ! grep -q -e '--longhaul' "${tool}.help.txt"; then
+              echo "${tool} --help does not mention --longhaul"
+              head -50 "${tool}.help.txt"
+              exit 1
+            fi
+            grep -e '--longhaul' "${tool}.help.txt"
+            rm -f "${tool}.version.txt" "${tool}.help.txt"
+          done
+
+      - name: Upload zip
+        id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ env.PKG }}.zip
+          archive: false
+
+      - name: Generate Flint test models
+        id: gen_models
+        continue-on-error: true
+        timeout-minutes: 15
+        run: |
+          mkdir -p flint-models
+          ./build/bin/test-llama-archs -a flint -o flint-models
+          ls -la flint-models
+
+      - name: Longhaul ctest (informational)
+        id: ctest_longhaul
+        continue-on-error: true
+        timeout-minutes: 20
+        run: |
+          cd build
+          ctest -R longhaul --output-on-failure --timeout 900
+
+      - name: Longhaul Metal (informational)
+        id: metal_longhaul
+        continue-on-error: true
+        timeout-minutes: 15
+        run: |
+          system_profiler SPDisplaysDataType || true
+          test -f flint-models/flint-moe.gguf
+          ./build/bin/test-longhaul --metal-model flint-models/flint-moe.gguf 2359296 2
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Metal dev build"
+            echo "- commit: ${GITHUB_SHA}"
+            echo "- zip: ${PKG}.zip"
+            echo "- generate models: ${{ steps.gen_models.outcome }}"
+            echo "- ctest -R longhaul: ${{ steps.ctest_longhaul.outcome }}"
+            echo "- test-longhaul --metal-model: ${{ steps.metal_longhaul.outcome }}"
+          } >> "$GITHUB_STEP_SUMMARY"
