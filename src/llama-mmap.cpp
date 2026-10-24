@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <mutex>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -67,8 +68,12 @@ static std::string llama_format_win_err(DWORD err) {
 // llama_file
 
 struct llama_file::impl {
+    bool no_cache = false;
+
 #if defined(_WIN32)
     HANDLE fp_win32;
+    std::mutex read_at_mutex;
+
     std::string GetErrorMessageWin32(DWORD error_code) const {
         std::string ret;
         LPSTR lpMsgBuf = NULL;
@@ -444,6 +449,51 @@ void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw(ptr, 
 #else
 void llama_file::read_raw_unsafe(void * ptr, size_t len) { pimpl->read_raw_unsafe(ptr, len); }
 #endif
+
+void llama_file::read_at(void * ptr, size_t len, size_t offset) {
+#ifdef _WIN32
+    // The Windows FILE pointer is shared by all longhaul I/O workers. Keep the
+    // seek and read together so concurrent jobs cannot change each other's
+    // offsets. POSIX uses pread below and does not need this serialization.
+    std::lock_guard<std::mutex> lock(pimpl->read_at_mutex);
+    seek(offset, SEEK_SET);
+    read_raw(ptr, len);
+#else
+    size_t n_read = 0;
+    while (n_read < len) {
+        const ssize_t result = pread(file_id(), static_cast<char *>(ptr) + n_read, len - n_read, offset + n_read);
+        if (result < 0 && errno == EINTR) {
+            continue;
+        }
+        if (result <= 0) {
+            throw std::runtime_error(format("failed to read %zu bytes at offset %zu: %s",
+                len, offset, result == 0 ? "unexpected end of file" : strerror(errno)));
+        }
+        n_read += result;
+    }
+#if defined(__linux__) && defined(POSIX_FADV_DONTNEED)
+    if (pimpl->no_cache) {
+        // Longhaul owns a bounded expert cache, so avoid retaining a second
+        // long-lived copy of completed reads in the kernel page cache.
+        (void) posix_fadvise(file_id(), (off_t) offset, (off_t) len, POSIX_FADV_DONTNEED);
+    }
+#endif
+#endif
+}
+
+void llama_file::set_no_cache() const {
+#if defined(__APPLE__) && defined(F_NOCACHE)
+    if (fcntl(file_id(), F_NOCACHE, 1) != 0) {
+        throw std::runtime_error(format("failed to disable file cache: %s", strerror(errno)));
+    }
+#elif defined(__linux__) && defined(POSIX_FADV_RANDOM)
+    pimpl->no_cache = true;
+    const int err = posix_fadvise(file_id(), 0, 0, POSIX_FADV_RANDOM);
+    if (err != 0) {
+        LLAMA_LOG_WARN("%s: failed to set random-access file advice: %s\n", __func__, strerror(err));
+    }
+#endif
+}
 
 uint32_t llama_file::read_u32() { return pimpl->read_u32(); }
 

@@ -68,6 +68,16 @@ struct llama_model_loader {
     static const int TENSOR_SKIP_IF_VIRTUAL = 1 << 3;
     static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
     static const int TENSOR_READ_LAZY       = 1 << 5; // read rows on demand instead of loading whole tensor; requires mmap for now
+    static const int TENSOR_LONGHAUL        = 1 << 6; // routed expert tensor streamed through the longhaul cache
+
+    // a routed expert tensor that longhaul fills on demand from its file
+    struct longhaul_source {
+        ggml_tensor * tensor;      // slot-sized cache tensor
+        uint16_t      file_idx;    // source file index
+        size_t        offset;      // offset of expert 0 in the file
+        size_t        expert_size; // bytes per expert
+        int           layer;
+    };
 
     int n_kv      = 0;
     int n_tensors = 0;
@@ -78,6 +88,7 @@ struct llama_model_loader {
 
     bool use_mmap = false;
     bool use_direct_io = false;
+    bool use_longhaul = false;
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;
@@ -116,6 +127,8 @@ struct llama_model_loader {
     } lazy;
 
     llama_files files;
+    size_t longhaul_slots = 0;
+    std::vector<longhaul_source> longhaul_sources;
     llama_ftype ftype;
     llama_fver  fver;
 
@@ -215,6 +228,9 @@ struct llama_model_loader {
     bool get_key_or_arr(enum llm_kv kid, uint32_t & result, bool required = true);
 
     std::string get_arch_name() const;
+
+    // sizes the longhaul expert cache from the routed expert tensors of the file
+    void configure_longhaul(uint64_t cache_bytes, uint32_t n_expert, uint32_t n_layer);
 
     enum llm_arch get_arch() const;
 

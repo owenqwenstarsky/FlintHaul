@@ -17,6 +17,7 @@
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
+struct llama_longhaul_cache;
 struct llama_model;
 
 // available models
@@ -889,6 +890,7 @@ struct llama_model {
     ggml_backend_buffer_type_t select_buft(int il) const;
 
     bool has_tensor_overrides() const;
+    llama_longhaul_cache * longhaul_cache() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 
@@ -936,6 +938,7 @@ struct llama_model_base : public llama_model {
     const int TENSOR_SKIP_IF_VIRTUAL;
     const int TENSOR_ALLOW_RESHAPE;
     const int TENSOR_READ_LAZY;
+    const int TENSOR_LONGHAUL;
 
     explicit llama_model_base(const llama_model_params & params);
     virtual ~llama_model_base() = default;

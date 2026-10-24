@@ -304,6 +304,26 @@ static void test(void) {
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
     assert(params.load_mode == LLAMA_LOAD_MODE_DIRECT_IO);
 
+    params.longhaul_cache_bytes = 0;
+    argv = {"binary_name", "--longhaul"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+
+    argv = {"binary_name", "--longhaul", "--longhaul-cache", "2"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.load_mode == LLAMA_LOAD_MODE_LONGHAUL);
+    assert(params.longhaul_cache_bytes == 2ULL * 1024 * 1024 * 1024);
+
+    argv = {"binary_name", "-lm", "longhaul", "--longhaul-cache", "1"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+    assert(params.load_mode == LLAMA_LOAD_MODE_LONGHAUL);
+    assert(params.longhaul_cache_bytes == 1ULL * 1024 * 1024 * 1024);
+
+    argv = {"binary_name", "--longhaul-cache", "0"};
+    assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
+
+    params.load_mode = LLAMA_LOAD_MODE_DIRECT_IO;
+    params.longhaul_cache_bytes = 0;
+
     // multi-value args (CSV)
     argv = {"binary_name", "--lora", "file1.gguf,\"file2,2.gguf\",\"file3\"\"3\"\".gguf\",file4\".gguf"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
