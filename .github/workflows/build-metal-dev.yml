@@ -1,7 +1,13 @@
 name: Build Metal dev (macOS arm64)
 
 on:
-  workflow_dispatch: # manual only
+  # runs when this file changes on the dev branch
+  push:
+    branches:
+      - claude/vigilant-ptolemy-mme1h4
+    paths:
+      - .github/workflows/build-metal-dev.yml
+  workflow_dispatch:
 
 permissions:
   contents: read
