@@ -272,6 +272,29 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
     )
 
+    # longhaul expert cache: unit tests, and a comparison against the regular loader on the generated models
+    llama_build_and_test(test-longhaul.cpp  LABEL behavior)
+    # the generated Flint MoE model has 2 routed experts per layer, 1179648 bytes per expert slot across the MoE layers
+    llama_test(
+        test-longhaul
+        NAME test-longhaul-cpu-flint
+        LABEL "main behavior"
+        ARGS --cpu-model "${MODEL_DIR}/flint-moe.gguf" 2359296 2
+    )
+    set_tests_properties(test-longhaul-cpu-flint PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+    # one slot per layer: the two selected experts run in two stages
+    llama_test(
+        test-longhaul
+        NAME test-longhaul-cpu-flint-one-slot
+        LABEL "main behavior"
+        ARGS --cpu-model "${MODEL_DIR}/flint-moe.gguf" 1179648 1
+    )
+    set_tests_properties(test-longhaul-cpu-flint-one-slot PROPERTIES
+        FIXTURES_REQUIRED generate-models
+    )
+
     llama_build(test-fusion.cpp)
 endif()
 

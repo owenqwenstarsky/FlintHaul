@@ -211,6 +211,7 @@ extern "C" {
         LLAMA_LOAD_MODE_MLOCK      =  2, // force system to keep model in RAM rather than swapping or compressing
         LLAMA_LOAD_MODE_MMAP_MLOCK =  3, // mmap + force system to keep model in RAM rather than swapping or compressing
         LLAMA_LOAD_MODE_DIRECT_IO  =  4, // use direct I/O if available
+        LLAMA_LOAD_MODE_LONGHAUL   =  5, // stream routed MoE experts through a bounded cache
     };
 
     LLAMA_API const char * llama_load_mode_name(enum llama_load_mode load_mode);
@@ -354,6 +355,8 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+
+        uint64_t longhaul_cache_bytes; // routed expert cache size for LLAMA_LOAD_MODE_LONGHAUL
     };
 
     struct llama_sampler_seq_config {

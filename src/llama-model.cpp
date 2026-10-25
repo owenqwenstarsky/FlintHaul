@@ -3,6 +3,7 @@
 #include "llama-arch.h"
 #include "llama-ext.h"
 #include "llama-hparams.h"
+#include "llama-longhaul.h"
 #include "llama-impl.h"
 #include "llama-mmap.h"
 #include "llama-cparams.h"
@@ -1292,6 +1293,7 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
+    std::unique_ptr<llama_longhaul_cache> longhaul;
 };
 
 bool llama_prec_policy::apply(ggml_tensor * res) const {
@@ -1718,6 +1720,49 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             throw std::runtime_error("model has expert layers but no expert layers are used");
         }
 
+        if (params.load_mode == LLAMA_LOAD_MODE_LONGHAUL) {
+            if (arch != LLM_ARCH_FLINT) {
+                throw std::runtime_error("longhaul currently requires a flint model");
+            }
+            if (hparams.n_layer_nextn != 0 || params.load_mtp) {
+                throw std::runtime_error("longhaul does not support MTP tensors");
+            }
+            if (params.check_tensors || params.no_alloc || params.vocab_only) {
+                throw std::runtime_error("longhaul does not support check-tensors, no-alloc, or vocab-only loading");
+            }
+            if (!hdmd.weight_blocks.empty()) {
+                throw std::runtime_error("longhaul does not support prism.hadamard models");
+            }
+            bool all_cpu = true;
+            bool all_metal = true;
+            for (int il = 0; il < n_layer_all; ++il) {
+                ggml_backend_dev_t dev = pimpl->dev_layer[il].dev;
+                const char * backend = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
+                all_cpu = all_cpu && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+                all_metal = all_metal &&
+                    ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU &&
+                    strcmp(backend, "MTL") == 0;
+            }
+            if (!all_cpu && !all_metal) {
+                throw std::runtime_error(
+                    "longhaul requires every repeating model layer on CPU or Metal; "
+                    "use --n-gpu-layers 0 for CPU mode");
+            }
+#if !defined(__APPLE__)
+            if (all_metal) {
+                throw std::runtime_error("longhaul Metal mode is only supported on macOS");
+            }
+#endif
+            LLAMA_LOG_INFO("%s: longhaul using %s expert cache\n", __func__, all_cpu ? "CPU" : "Metal");
+            ml.configure_longhaul(params.longhaul_cache_bytes, n_expert, n_layer_all);
+            if (ml.longhaul_slots < (size_t) hparams.n_expert_used_max()) {
+                LLAMA_LOG_WARN("%s: longhaul cache has %zu slots for %lld selected experts; "
+                    "each MoE layer will run in %zu stages\n",
+                    __func__, ml.longhaul_slots, (long long) hparams.n_expert_used_max(),
+                    ((size_t) hparams.n_expert_used_max() + ml.longhaul_slots - 1) / ml.longhaul_slots);
+            }
+        }
+
         layers.resize(n_layer_all);
 
         // call the per-model loading function
@@ -2059,6 +2104,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     load_tensors_hadamard();
+
+    if (params.load_mode == LLAMA_LOAD_MODE_LONGHAUL) {
+        pimpl->longhaul = std::make_unique<llama_longhaul_cache>(
+            std::move(ml.files), std::move(ml.longhaul_sources), ml.longhaul_slots, hparams.n_expert, n_layer_all);
+    }
 
     return true;
 }
@@ -2755,6 +2805,10 @@ bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
 }
 
+llama_longhaul_cache * llama_model::longhaul_cache() const {
+    return pimpl->longhaul.get();
+}
+
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
     auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
             [name](const std::pair<std::string, ggml_tensor *> & it) {
@@ -3385,6 +3439,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.longhaul_cache_bytes        =*/ 0,
     };
 
     return result;
@@ -3851,7 +3906,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
     TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
     TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
     TENSOR_ALLOW_RESHAPE  (llama_model_loader::TENSOR_ALLOW_RESHAPE),
-    TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY) {}
+    TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY),
+    TENSOR_LONGHAUL       (llama_model_loader::TENSOR_LONGHAUL) {}
 
 ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     GGML_ASSERT(ml != nullptr);

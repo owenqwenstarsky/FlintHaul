@@ -891,6 +891,10 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     // parse all CLI args now, so that -hf is available below for remote preset resolution
     parse_cli_args();
 
+    if (params.load_mode == LLAMA_LOAD_MODE_LONGHAUL && params.longhaul_cache_bytes == 0) {
+        throw std::invalid_argument("error: --longhaul requires --longhaul-cache N\n");
+    }
+
     postprocess_cpu_params(params.cpuparams,       nullptr);
     postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
 
@@ -2707,7 +2711,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "- mmap: memory-map model (if mmap disabled, slower load but may reduce pageouts if not using mlock)\n"
         "- mlock: force system to keep model in RAM rather than swapping or compressing\n"
         "- mmap+mlock: mmap + force system to keep model in RAM rather than swapping or compressing\n"
-        "- dio: use DirectIO if available\n",
+        "- dio: use DirectIO if available\n"
+        "- longhaul: stream routed MoE experts through a bounded cache\n",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "auto")       { params.load_mode = LLAMA_LOAD_MODE_AUTO;       }
             else if (value == "none")       { params.load_mode = LLAMA_LOAD_MODE_NONE;       }
@@ -2715,9 +2720,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             else if (value == "mlock")      { params.load_mode = LLAMA_LOAD_MODE_MLOCK;      }
             else if (value == "mmap+mlock") { params.load_mode = LLAMA_LOAD_MODE_MMAP_MLOCK; }
             else if (value == "dio")        { params.load_mode = LLAMA_LOAD_MODE_DIRECT_IO;  }
+            else if (value == "longhaul")   { params.load_mode = LLAMA_LOAD_MODE_LONGHAUL;   }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_LOAD_MODE"));
+    add_opt(common_arg(
+        {"--longhaul"},
+        "stream routed Flint experts through a bounded CPU or Metal cache",
+        [](common_params & params) {
+            params.load_mode = LLAMA_LOAD_MODE_LONGHAUL;
+        }
+    ).set_env("LLAMA_ARG_LONGHAUL"));
+    add_opt(common_arg(
+        {"--longhaul-cache"}, "N",
+        "longhaul expert cache size in GiB",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("longhaul cache size must be positive");
+            }
+            params.longhaul_cache_bytes = uint64_t(value) * 1024 * 1024 * 1024;
+        }
+    ).set_env("LLAMA_ARG_LONGHAUL_CACHE"));
     add_opt(common_arg(
         {"-lzm", "--lazy-mode"}, "MODE",
         "on-demand reading of certain tensors, for example per-layer embeddings (default: auto)\n"

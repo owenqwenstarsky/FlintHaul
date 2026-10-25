@@ -1452,7 +1452,12 @@ private:
 
         slots.clear();
 
-        ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
+        // This capability probe performs a real two-token decode. Longhaul
+        // must not read routed experts before the first user request, and it
+        // does not support speculative/MTP decoding, so skip the probe.
+        ctx_tgt_seq_rm_type = params_base.load_mode == LLAMA_LOAD_MODE_LONGHAUL
+            ? COMMON_CONTEXT_SEQ_RM_TYPE_NO
+            : common_context_can_seq_rm(ctx_tgt);
         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
         }

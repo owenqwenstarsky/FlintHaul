@@ -4,6 +4,7 @@
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
+#include "llama-longhaul.h"
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
@@ -342,6 +343,20 @@ llama_context::llama_context(
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+    if (auto * longhaul = model.longhaul_cache()) {
+        if (params.embeddings) {
+            throw std::runtime_error("longhaul does not support embedding output");
+        }
+        if (params.moe_cache_size > 0) {
+            throw std::runtime_error("longhaul cannot be combined with the MoE cache (--moe-cache-mib)");
+        }
+        const uint32_t limit = longhaul->max_ubatch(hparams.n_expert_used_max());
+        if (cparams.n_ubatch > limit) {
+            LLAMA_LOG_WARN("%s: reducing n_ubatch from %u to %u for longhaul cache capacity\n",
+                __func__, cparams.n_ubatch, limit);
+            cparams.n_ubatch = limit;
+        }
+    }
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
@@ -950,6 +965,10 @@ uint32_t llama_context::n_seq_max() const {
     return cparams.n_seq_max;
 }
 
+bool llama_context::has_longhaul() const {
+    return model.longhaul_cache() != nullptr;
+}
+
 uint32_t llama_context::n_threads() const {
     return cparams.n_threads;
 }
@@ -1550,7 +1569,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        ggml_backend_sched_set_eval_callback(
+            sched.get(),
+            model.longhaul_cache() ? longhaul_eval_callback : cparams.cb_eval,
+            model.longhaul_cache() ? static_cast<void *>(this) : cparams.cb_eval_user_data);
 
         //const auto t_start_us = ggml_time_us();
 
@@ -2528,7 +2550,8 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     } else if (model.arch == LLM_ARCH_HRM_TEXT) {
         // the 128-slot looped graph needs roughly one stack per token budget
         res = std::max<uint32_t>(n_tokens * 80, 64u * model.n_tensors());
-    } else if (model.arch == LLM_ARCH_QWEN3NEXT ||
+    } else if (has_longhaul() ||
+        model.arch == LLM_ARCH_QWEN3NEXT ||
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_BAILINGMOE3 ||
         model.arch == LLM_ARCH_QWEN35 ||
@@ -2716,6 +2739,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
+        /*.longhaul    =*/ model.longhaul_cache(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
         /*.samplers    =*/ sampling.samplers,
@@ -2766,13 +2790,53 @@ ggml_status llama_context::graph_compute(
     copy_experts.reset();
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    if (auto * longhaul = model.longhaul_cache(); longhaul && longhaul->failed()) {
+        status = GGML_STATUS_FAILED;
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
+        if (auto * longhaul = model.longhaul_cache()) {
+            // a failed graph can leave a layer locked
+            longhaul->release(-1);
+        }
     }
 
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
     return status;
+}
+
+bool llama_context::longhaul_eval_callback(ggml_tensor * tensor, bool ask, void * user_data) {
+    auto * ctx = static_cast<llama_context *>(user_data);
+    auto * cache = ctx->model.longhaul_cache();
+    GGML_ASSERT(cache != nullptr);
+
+    int layer = -1;
+    const bool remap = sscanf(tensor->name, "longhaul.remap.%d", &layer) == 1;
+    layer = -1;
+    const bool release = sscanf(tensor->name, "longhaul.release.%d", &layer) == 1;
+    const bool internal = remap || release;
+
+    bool user_needs = false;
+    if (ctx->cparams.cb_eval) {
+        user_needs = ctx->cparams.cb_eval(tensor, true, ctx->cparams.cb_eval_user_data);
+    }
+    if (ask) {
+        return internal || user_needs;
+    }
+
+    if (remap) {
+        sscanf(tensor->name, "longhaul.remap.%d", &layer);
+        if (!cache->remap(layer, tensor)) {
+            LLAMA_LOG_ERROR("%s: failed to fill layer %d cache: %s\n", __func__, layer, cache->error().c_str());
+            return false;
+        }
+    } else if (release) {
+        sscanf(tensor->name, "longhaul.release.%d", &layer);
+        cache->release(layer);
+    }
+
+    return !user_needs || ctx->cparams.cb_eval(tensor, false, ctx->cparams.cb_eval_user_data);
 }
 
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
@@ -4375,6 +4439,11 @@ int32_t llama_set_adapters_lora(
             float * scales) {
     if (adapters == nullptr || scales == nullptr) {
         GGML_ASSERT(n_adapters == 0 && "invalid llama_set_adapters_lora call");
+    }
+
+    if (ctx->has_longhaul() && n_adapters > 0) {
+        LLAMA_LOG_ERROR("%s: longhaul does not support LoRA adapters\n", __func__);
+        return -1;
     }
 
     ctx->set_adapters_lora(adapters, n_adapters, scales);

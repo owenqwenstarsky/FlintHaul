@@ -1251,7 +1251,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
-    if (params.fit_params) {
+    if (params.fit_params && params.load_mode != LLAMA_LOAD_MODE_LONGHAUL) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
 
@@ -1283,6 +1283,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+    } else if (params.fit_params) {
+        COM_INF("%s", "longhaul: skipping full-model device fitting\n");
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
@@ -1499,7 +1501,12 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         common_set_adapter_lora(lctx, params.lora_adapters);
     }
 
-    if (params.warmup) {
+    // Longhaul expert weights are intentionally loaded on demand. A startup
+    // warmup is a real decode, so it would populate the expert cache before
+    // the first user request and defeat lazy loading.
+    if (params.warmup && params.load_mode == LLAMA_LOAD_MODE_LONGHAUL) {
+        COM_TRC("%s", "longhaul: skipping model warmup to keep routed experts lazy\n");
+    } else if (params.warmup) {
         COM_TRC("%s", "warming up the model with an empty run - please wait ... (--no-warmup to disable)\n");
 
         std::vector<llama_token> tmp;
@@ -1689,6 +1696,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.load_mode       = params.load_mode;
+    mparams.longhaul_cache_bytes = params.longhaul_cache_bytes;
     mparams.lazy_mode = params.lazy_mode;
     mparams.tensor_split    = params.tensor_split;
     mparams.check_tensors   = params.check_tensors;

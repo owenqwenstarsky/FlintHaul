@@ -559,6 +559,7 @@ llama_model_loader::llama_model_loader(
 
     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
+    this->use_longhaul  = load_mode == LLAMA_LOAD_MODE_LONGHAUL;
 
     if (!fname.empty()) {
         // Load the main GGUF
@@ -835,6 +836,45 @@ llama_model_loader::llama_model_loader(
     this->check_tensors = check_tensors;
     this->no_alloc = no_alloc;
     this->load_mtp = load_mtp;
+}
+
+void llama_model_loader::configure_longhaul(uint64_t cache_bytes, uint32_t n_expert, uint32_t n_layer) {
+    if (!use_longhaul) {
+        return;
+    }
+    if (cache_bytes == 0 || n_expert == 0 || n_layer == 0) {
+        throw std::runtime_error("invalid longhaul cache configuration");
+    }
+
+    size_t bytes_per_slot = 0;
+    for (const auto & entry : weights_map) {
+        const std::string & name = entry.first;
+        const ggml_tensor * tensor = entry.second.tensor;
+        int layer = -1;
+        if (sscanf(name.c_str(), "blk.%d.", &layer) != 1 || layer < 0 || layer >= (int) n_layer) {
+            continue;
+        }
+        const bool routed =
+            name.find("ffn_gate_up_exps.weight") != std::string::npos ||
+            name.find("ffn_gate_exps.weight")    != std::string::npos ||
+            name.find("ffn_up_exps.weight")      != std::string::npos ||
+            name.find("ffn_down_exps.weight")    != std::string::npos;
+        if (routed && tensor->ne[2] == (int64_t) n_expert) {
+            bytes_per_slot += tensor->nb[2];
+        }
+    }
+    if (bytes_per_slot == 0) {
+        throw std::runtime_error("longhaul found no supported routed expert tensors");
+    }
+
+    longhaul_slots = std::min<size_t>(n_expert, cache_bytes / bytes_per_slot);
+    if (longhaul_slots == 0) {
+        throw std::runtime_error("longhaul cache is too small for one expert slot per layer");
+    }
+
+    LLAMA_LOG_INFO("%s: cache = %.2f MiB, slots per layer = %zu, payload = %.2f MiB\n",
+        __func__, cache_bytes / 1024.0 / 1024.0, longhaul_slots,
+        longhaul_slots * bytes_per_slot / 1024.0 / 1024.0);
 }
 
 std::string llama_model_loader::get_arch_name() const {
@@ -1238,6 +1278,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         ggml_backend_buffer_type_t buft = nullptr;
+        ggml_backend_buffer_type_t requested_override = nullptr;
 
         // check overrides
         if (tensor_buft_overrides) {
@@ -1245,6 +1286,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
                 std::regex pattern(overrides->pattern);
                 if (std::regex_search(tensor_name, pattern)) {
+                    requested_override = overrides->buft;
                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
                         // when overriding to a CPU buffer, consider the extra buffer types
                         buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
@@ -1272,6 +1314,25 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             if (!buft) {
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
             }
+        }
+
+        // Streamed CPU experts are updated one expert slice at a time. CPU
+        // repack and accelerator buffers only accept whole-tensor updates, so
+        // keep these cache tensors in the standard, directly writable layout.
+        if ((flags & TENSOR_LONGHAUL) && buft_list == buft_list_cpu) {
+            auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            if (!cpu_dev) {
+                throw std::runtime_error("no CPU backend found");
+            }
+            ggml_backend_buffer_type_t cpu_buft = ggml_backend_dev_buffer_type(cpu_dev);
+            if (requested_override != nullptr &&
+                requested_override != ggml_backend_cpu_buffer_type() &&
+                requested_override != cpu_buft) {
+                throw std::runtime_error(format(
+                    "longhaul CPU expert tensor '%s' has an incompatible buffer override",
+                    tn.str().c_str()));
+            }
+            buft = cpu_buft;
         }
 
         // avoid using a host buffer when using mmap
@@ -1385,7 +1446,19 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     const bool duplicated = flags & TENSOR_DUPLICATED;
 
-    struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
+    struct ggml_tensor * tensor;
+    if (flags & TENSOR_LONGHAUL) {
+        if (!use_longhaul || longhaul_slots == 0 || t_meta.ne[2] <= 1) {
+            throw std::runtime_error(format("invalid longhaul tensor '%s'", t_meta.name));
+        }
+        tensor = ggml_new_tensor_4d(ctx, t_meta.type, t_meta.ne[0], t_meta.ne[1], longhaul_slots, t_meta.ne[3]);
+        int layer = -1;
+        sscanf(t_meta.name, "blk.%d.", &layer);
+        const auto & weight = require_weight(t_meta.name);
+        longhaul_sources.push_back({ tensor, weight.idx, weight.offs, (size_t) t_meta.nb[2], layer });
+    } else {
+        tensor = ggml_dup_tensor(ctx, &t_meta);
+    }
     ggml_set_name(tensor, ggml_get_name(&t_meta));
 
     if (duplicated) {
@@ -1449,8 +1522,17 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     }
 
     // compute the total size of all tensors for progress reporting
-    for (const auto & it : weights_map) {
-        size_data += ggml_nbytes(it.second.tensor);
+    if (use_longhaul) {
+        // streamed expert tensors only occupy their cache slots
+        for (const auto & entry : ctx_map) {
+            for (ggml_tensor * tensor = ggml_get_first_tensor(entry.second.get()); tensor; tensor = ggml_get_next_tensor(entry.second.get(), tensor)) {
+                size_data += ggml_nbytes(tensor);
+            }
+        }
+    } else {
+        for (const auto & it : weights_map) {
+            size_data += ggml_nbytes(it.second.tensor);
+        }
     }
 }
 
@@ -1702,6 +1784,14 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        // streamed experts are filled on demand by the longhaul cache
+        const bool is_longhaul = std::any_of(longhaul_sources.begin(), longhaul_sources.end(),
+            [cur](const longhaul_source & source) { return source.tensor == cur; });
+        if (is_longhaul) {
+            size_done += n_size;
+            continue;
+        }
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 

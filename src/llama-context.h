@@ -70,6 +70,7 @@ struct llama_context {
     uint32_t n_batch()   const;
     uint32_t n_ubatch()  const;
     uint32_t n_seq_max() const;
+    bool has_longhaul() const;
 
     uint32_t n_threads()       const;
     uint32_t n_threads_batch() const;
@@ -277,6 +278,9 @@ private:
     void sched_new(size_t max_nodes, bool parallel);
 
     // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
+    // handles the longhaul remap and release nodes, then forwards to the user's cb_eval
+    static bool longhaul_eval_callback(ggml_tensor * tensor, bool ask, void * user_data);
+
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
 
     // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context

@@ -355,6 +355,7 @@ struct cmd_params {
     std::vector<llama_split_mode>    split_mode;
     std::vector<llama_load_mode>     load_mode;
     std::vector<llama_lazy_mode>     lazy_mode;
+    uint64_t                         longhaul_cache_bytes;
     std::vector<int>                 main_gpu;
     std::vector<bool>                no_kv_offload;
     std::vector<llama_flash_attn_type> flash_attn;
@@ -401,6 +402,7 @@ static const cmd_params cmd_params_defaults = {
     /* split_mode           */ { LLAMA_SPLIT_MODE_LAYER },
     /* load_mode            */ { LLAMA_LOAD_MODE_AUTO },
     /* lazy_mode            */ { LLAMA_LAZY_MODE_AUTO },
+    /* longhaul_cache_bytes */ 0,
     /* main_gpu             */ { 0 },
     /* no_kv_offload        */ { false },
     /* flash_attn           */ { LLAMA_FLASH_ATTN_TYPE_AUTO },
@@ -477,7 +479,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -nkvo, --no-kv-offload <0|1>                      (default: %s)\n", join(cmd_params_defaults.no_kv_offload, ",").c_str());
     printf("  -fa, --flash-attn <on|off|auto>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.flash_attn, llama_flash_attn_type_name), ",").c_str());
     printf("  -dev, --device <dev0/dev1/...>                    (default: auto)\n");
-    printf("  -lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio> (default: %s)\n", join(transform_to_str(cmd_params_defaults.load_mode, llama_load_mode_name), ",").c_str());
+    printf("  -lm, --load-mode <auto|none|mmap|mlock|mmap+mlock|dio|longhaul> (default: %s)\n", join(transform_to_str(cmd_params_defaults.load_mode, llama_load_mode_name), ",").c_str());
+    printf("  --longhaul-cache <GiB>                            expert cache size for longhaul mode\n");
     printf("  -lzm, --lazy-mode <on|auto|off>                   (default: %s)\n", join(transform_to_str(cmd_params_defaults.lazy_mode, lazy_mode_str), ",").c_str());
     printf("  -embd, --embeddings <0|1>                         (default: %s)\n", join(cmd_params_defaults.embeddings, ",").c_str());
     printf("  -ts, --tensor-split <ts0/ts1/..>                  (default: 0)\n");
@@ -539,6 +542,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
     params.offline              = cmd_params_defaults.offline;
+    params.longhaul_cache_bytes = cmd_params_defaults.longhaul_cache_bytes;
 
     if (const char * env = getenv("HF_TOKEN")) {
         params.hf_token = env;
@@ -797,6 +801,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                         mode = LLAMA_LOAD_MODE_MMAP_MLOCK;
                     } else if (m == "dio") {
                         mode = LLAMA_LOAD_MODE_DIRECT_IO;
+                    } else if (m == "longhaul") {
+                        mode = LLAMA_LOAD_MODE_LONGHAUL;
                     } else {
                         invalid_param = true;
                         break;
@@ -807,6 +813,17 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     break;
                 }
                 params.load_mode.insert(params.load_mode.end(), modes.begin(), modes.end());
+            } else if (arg == "--longhaul-cache") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                const uint64_t gib = std::stoull(argv[i]);
+                if (gib == 0 || gib > UINT64_MAX / 1024 / 1024 / 1024) {
+                    invalid_param = true;
+                    break;
+                }
+                params.longhaul_cache_bytes = gib * 1024 * 1024 * 1024;
             } else if (arg == "-lzm" || arg == "--lazy-mode") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1156,6 +1173,11 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     if (params.lazy_mode.empty()) {
         params.lazy_mode = cmd_params_defaults.lazy_mode;
     }
+    if (std::find(params.load_mode.begin(), params.load_mode.end(), LLAMA_LOAD_MODE_LONGHAUL) != params.load_mode.end() &&
+        params.longhaul_cache_bytes == 0) {
+        fprintf(stderr, "error: longhaul load mode requires --longhaul-cache N\n");
+        exit(1);
+    }
     if (params.main_gpu.empty()) {
         params.main_gpu = cmd_params_defaults.main_gpu;
     }
@@ -1226,6 +1248,7 @@ struct cmd_params_instance {
     llama_split_mode   split_mode;
     llama_load_mode    load_mode;
     llama_lazy_mode    lazy_mode;
+    uint64_t           longhaul_cache_bytes;
     int                main_gpu;
     bool               no_kv_offload;
     llama_flash_attn_type flash_attn;
@@ -1249,6 +1272,7 @@ struct cmd_params_instance {
         mparams.split_mode    = split_mode;
         mparams.load_mode     = load_mode;
         mparams.lazy_mode     = lazy_mode;
+        mparams.longhaul_cache_bytes = longhaul_cache_bytes;
         mparams.main_gpu      = main_gpu;
         mparams.tensor_split  = tensor_split.data();
         mparams.no_host       = no_host;
@@ -1298,6 +1322,7 @@ struct cmd_params_instance {
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
                load_mode == other.load_mode && lazy_mode == other.lazy_mode &&
+               longhaul_cache_bytes == other.longhaul_cache_bytes &&
                devices == other.devices && no_host == other.no_host && repack == other.repack &&
                vec_tensor_buft_override_equal(tensor_buft_overrides, other.tensor_buft_overrides);
     }
@@ -1374,6 +1399,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
+                /* .longhaul_cache_bytes  = */ params.longhaul_cache_bytes,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
                 /* .flash_attn            = */ fa,
@@ -1412,6 +1438,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
+                /* .longhaul_cache_bytes  = */ params.longhaul_cache_bytes,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
                 /* .flash_attn            = */ fa,
@@ -1450,6 +1477,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .split_mode            = */ sm,
                 /* .load_mode             = */ lm,
                 /* .lazy_mode             = */ lzm,
+                /* .longhaul_cache_bytes  = */ params.longhaul_cache_bytes,
                 /* .main_gpu              = */ mg,
                 /* .no_kv_offload         = */ nkvo,
                 /* .flash_attn            = */ fa,
@@ -1493,6 +1521,7 @@ struct test {
     llama_split_mode         split_mode;
     llama_load_mode          load_mode;
     llama_lazy_mode          lazy_mode;
+    uint64_t                 longhaul_cache_bytes;
     int                      main_gpu;
     bool                     no_kv_offload;
     llama_flash_attn_type    flash_attn;
@@ -1534,6 +1563,7 @@ struct test {
         split_mode     = inst.split_mode;
         load_mode      = inst.load_mode;
         lazy_mode      = inst.lazy_mode;
+        longhaul_cache_bytes = inst.longhaul_cache_bytes;
         main_gpu       = inst.main_gpu;
         no_kv_offload  = inst.no_kv_offload;
         flash_attn     = inst.flash_attn;
@@ -1602,7 +1632,7 @@ struct test {
             "n_ubatch",       "n_threads",      "cpu_mask",      "cpu_strict",     "poll",
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
-            "tensor_buft_overrides",            "load_mode",     "lazy_mode",
+            "tensor_buft_overrides",            "load_mode",     "lazy_mode",     "longhaul_cache_bytes",
             "embeddings",
             "no_op_offload",  "no_host",        "repack",        "fit_target",    "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_depth",
@@ -1618,7 +1648,8 @@ struct test {
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
-            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn") {
+            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn" ||
+            field == "longhaul_cache_bytes") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
@@ -1699,6 +1730,7 @@ struct test {
                                             tensor_buft_overrides_str,
                                             llama_load_mode_name(load_mode),
                                             lazy_mode_str(lazy_mode),
+                                            std::to_string(longhaul_cache_bytes),
                                             std::to_string(embeddings),
                                             std::to_string(no_op_offload),
                                             std::to_string(no_host),
@@ -2022,6 +2054,9 @@ struct markdown_printer : public printer {
         }
         if (params.lazy_mode.size() > 1 || params.lazy_mode != cmd_params_defaults.lazy_mode) {
             fields.emplace_back("lazy_mode");
+        }
+        if (params.longhaul_cache_bytes != cmd_params_defaults.longhaul_cache_bytes) {
+            fields.emplace_back("longhaul_cache_bytes");
         }
         if (params.embeddings.size() > 1 || params.embeddings != cmd_params_defaults.embeddings) {
             fields.emplace_back("embeddings");
